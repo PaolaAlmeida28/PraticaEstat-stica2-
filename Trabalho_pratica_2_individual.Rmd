@@ -1,0 +1,457 @@
+---
+title: "Análise Completa de PM2.5 - Bahia (2022-2023)"
+subtitle: "Análise Comparativa Donkelar e CAMS por Ano"
+author: "Paola Almeida"
+date: "`20/10/2025`"
+html_document:
+    # --- Adicione esta linha ---
+    code_folding: hide 
+    # ---------------------------
+    toc: true
+    toc_float: true
+---
+
+```{r setup_e_dados, include=FALSE}
+# Configurações globais: oculta o código R e garante o alinhamento central
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.align = "center")
+
+# --- DEFINIÇÃO DO DIRETÓRIO DE TRABALHO (VERIFIQUE O SEU CAMINHO) ---
+# ATENÇÃO: Se o RStudio não encontrar os arquivos CSV e XLSX, comente a linha abaixo.
+ setwd("C:/Users/KHALEDHIMTECH/Downloads")
+
+# Carregamento Explícito de TODOS os pacotes necessários
+library(lubridate)
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(readr)
+library(janitor)
+library(tidyr)
+library(geobr)
+library(sf)
+library(ggpubr)
+library(readxl) 
+library(kableExtra) 
+library(stringr)
+# --- 1. LEITURA, LIMPEZA E FILTRO PARA BAHIA (BA) ---
+library(readxl)
+library(lubridate)
+library(dplyr)
+library(reshape2)
+library(janitor) 
+
+# A. LEITURA DOS DADOS
+# Leitura CAMS 2023 (Base completa original - read.csv2 reconhece o ';')
+dadoscams2023 <- read.csv2("daily_pm25_all_regions_2023.csv", header = TRUE, stringsAsFactors = FALSE)
+
+# Leitura CAMS 2022 (Base COMPLETA ORIGINAL. A conversão vírgula/ponto será feita na função)
+dadoscams2022 <- read.csv2("daily_pm25_all_regions_2022.csv", header = TRUE, stringsAsFactors = FALSE)
+
+
+# Leitura e limpeza inicial Donkelar (Assumindo que você ainda está usando read_excel ou que o R leu os CSVs do Donkelar com janitor::clean_names())
+dadosdon2023 <- read_excel("Donkelar_dados_completos_consolidado_2023.xlsx") %>% janitor::clean_names()
+dadosdon2022 <- read_excel("Donkelar_dados_completos_consolidado_2022.xlsx") %>% janitor::clean_names()
+
+
+# --- B. PROCESSAMENTO DOS DADOS CAMS E CRIAÇÃO DE dadoscams_agr ---
+processar_cams_anual <- function(dados, ano_base) {
+    long <- dados %>%
+        reshape2::melt(id.vars="Date") 
+    
+    colnames(long) <- c("Date", "CodRes", "media_pm25_diaria")
+    
+    long <- long %>%
+        mutate(
+            cd_mun = as.character(substring(CodRes, 4, 10)),
+            date_raw = lubridate::dmy(Date), 
+            ano = lubridate::year(date_raw),
+            mes = lubridate::month(date_raw),
+            media_pm25_diaria = as.numeric(gsub(",", ".", as.character(media_pm25_diaria)))
+        )
+        
+    long <- long %>%
+        group_by(cd_mun, ano, mes) %>%
+        summarise(
+            media_pm25 = mean(media_pm25_diaria, na.rm = TRUE),
+            desvio_padrao_pm25 = sd(media_pm25_diaria, na.rm = TRUE),
+            min_pm25 = min(media_pm25_diaria, na.rm = TRUE),
+            max_pm25 = max(media_pm25_diaria, na.rm = TRUE),
+            .groups = 'drop'
+        ) %>%
+        mutate(Fonte = "CAMS", cd_uf = substr(cd_mun, 1, 2))
+    return(long)
+}
+
+# Processa e armazena os anos
+dadoscams_2022_proc <- processar_cams_anual(dadoscams2022, 2022)
+dadoscams_2023_proc <- processar_cams_anual(dadoscams2023, 2023)
+
+# CRIAÇÃO EXPLÍCITA DE DADOSCAMS_AGR 
+dadoscams_agr <- bind_rows(
+    dadoscams_2022_proc,
+    dadoscams_2023_proc
+) %>%
+    filter(!is.nan(media_pm25) & !is.na(media_pm25))
+
+
+# --- C. PROCESSAMENTO DOS DADOS DONKELAR E CRIAÇÃO DE dadosdon (CORRIGIDO) ---
+cols_padrao <- c("cd_mun", "nm_mun", "sigla_uf", "media_pm25", "desvio_padrao_pm25", "min_pm25", "max_pm25", "ano", "mes")
+
+processar_donkelar <- function(dados) {
+    
+    if ("sigla_uf_2" %in% names(dados)) {
+        dados <- dados %>% rename(sigla_uf = sigla_uf_2) 
+    }
+    
+    dados <- dados %>%
+      select(any_of(cols_padrao)) %>%
+      mutate(
+        cd_mun = as.character(cd_mun), 
+        # FIX: Garante que sigla_uf é character, resolvendo o erro de bind_rows
+        sigla_uf = as.character(sigla_uf), 
+        media_pm25 = as.numeric(as.character(media_pm25)) 
+      ) %>%
+      drop_na(media_pm25) 
+      
+    if (!"sigla_uf" %in% names(dados)) {
+        dados <- dados %>% mutate(sigla_uf = NA_character_)
+    }
+    
+    return(dados)
+}
+
+dadosdon <- bind_rows(
+    processar_donkelar(dadosdon2022),
+    processar_donkelar(dadosdon2023)
+) %>%
+  mutate(
+    Fonte = "Donkelar", 
+    sigla_uf = toupper(sigla_uf), 
+    cd_uf = substr(cd_mun, 1, 2) 
+  ) %>%
+  select(all_of(cols_padrao), Fonte, cd_uf) %>% 
+  drop_na(media_pm25)
+
+
+# --- D. COMBINAR AS DUAS FONTES E FILTRAR PARA BAHIA (BA) ---
+cols_comuns <- c("cd_mun", "cd_uf", "media_pm25", "desvio_padrao_pm25", "min_pm25", "max_pm25", "ano", "mes", "Fonte")
+
+dados_don_cams_mes_full <- bind_rows(
+  dadosdon %>% select(all_of(cols_comuns), nm_mun, sigla_uf),
+  dadoscams_agr %>% select(all_of(cols_comuns))
+)
+
+lookup_mun <- dados_don_cams_mes_full %>% 
+  distinct(cd_mun, .keep_all = TRUE) %>% 
+  select(cd_mun, nm_mun, sigla_uf) %>% 
+  drop_na(cd_mun)
+
+dados_don_cams_mes <- dados_don_cams_mes_full %>%
+  left_join(lookup_mun, by = "cd_mun", suffix = c("", ".lookup")) %>%
+  mutate(
+    nm_mun = coalesce(nm_mun, nm_mun.lookup), 
+    sigla_uf = coalesce(sigla_uf, sigla_uf.lookup)
+  ) %>%
+  select(-nm_mun.lookup, -sigla_uf.lookup) %>%
+  filter(cd_uf == "29") %>% 
+  drop_na(cd_mun, nm_mun, media_pm25)
+
+# --- 2. AGREGAÇÕES E LIMPEZA (Garante integridade dos dados) ---
+# Limpeza CRÍTICA para a estabilidade da análise
+
+dados_mun_mes_agregados <- dados_don_cams_mes %>%
+  select(cd_mun, nm_mun, sigla_uf, cd_uf, ano, mes, Fonte, media_pm25, desvio_padrao_pm25) %>%
+  # Limpeza CRÍTICA: Remove qualquer linha onde a Fonte ou o Ano seja NA/NULL
+  filter(!is.na(Fonte) & !is.na(ano)) %>%
+  # GARANTE QUE APENAS AS FONTES INTERESSADAS SEJAM MANTIDAS
+  filter(Fonte %in% c("Donkelar", "CAMS")) %>%
+  # LIMPA OS NAs NO VALOR DE PM2.5 (PARA OS BOXPLOTS E CÁLCULOS)
+  mutate(
+    media_pm25 = na_if(media_pm25, NaN), # Converte NaN para NA
+    # Garante que 'ano' é tratado como character (texto) para a pivotagem subsequente
+    ano = as.character(ano) 
+  ) %>%
+  # FILTRA LINHAS SEM MÉDIA PM25 VÁLIDA (CORREÇÃO BOXPLOT CAMS)
+  drop_na(media_pm25)
+
+# Agrega para Nível Anual (necessário para os Mapas e diferenças)
+dados_mun_ano_agregados <- dados_mun_mes_agregados %>%
+  group_by(cd_mun, nm_mun, sigla_uf, cd_uf, ano, Fonte) %>%
+  summarise(
+    media_pm25_anual = mean(media_pm25, na.rm = TRUE),
+    desvio_padrao_pm25_anual = sd(media_pm25, na.rm = TRUE), .groups = 'drop'
+  )
+
+# Criação da coluna de mês nomeado para o Boxplot
+dados_mun_mes_agregados$mes_nome <- factor(
+  dados_mun_mes_agregados$mes,
+  levels = 1:12,
+  labels = c("Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez")
+)
+
+# --- 3. PREPARAÇÃO DE DADOS GEOGRÁFICOS ---
+mapa_mun_ba <- read_municipality(code_muni = "BA", year = 2020) %>%
+  rename(cd_mun_geometry = code_muni) %>%
+  mutate(cd_mun = as.character(cd_mun_geometry)) %>%
+  select(cd_mun, geom)
+
+# Pivot para gerar o Mapa de Diferenças entre Fontes e Anos
+dados_mapa <- dados_mun_ano_agregados %>%
+  pivot_wider(
+    names_from = c(Fonte, ano),
+    values_from = media_pm25_anual,
+    id_cols = c(cd_mun),
+    # Define explicitamente o nome da coluna no formato {Fonte}_{ano}
+    names_glue = "{Fonte}_{ano}" 
+  ) 
+
+# PASSO DE CORREÇÃO CRUCIAL:
+# Adiciona as colunas com NA se estiverem faltando (previne "objeto não encontrado").
+required_cols <- c("Donkelar_2022", "Donkelar_2023", "CAMS_2022", "CAMS_2023")
+for (col in required_cols) {
+    if (!col %in% names(dados_mapa)) {
+        dados_mapa[[col]] <- NA_real_ # Adiciona a coluna com NA
+    }
+}
+
+# Agora o cálculo de diferença (as colunas estão garantidas)
+dados_mapa <- dados_mapa %>%
+  mutate(
+    # Diferença Donkelar (Ano 2 - Ano 1)
+    Donkelar_Dif_Anual = Donkelar_2023 - Donkelar_2022,
+    # Diferença CAMS (Ano 2 - Ano 1)
+    CAMS_Dif_Anual = CAMS_2023 - CAMS_2022,
+    # Diferença Donkelar vs CAMS em 2022
+    Diferenca_2022 = Donkelar_2022 - CAMS_2022,
+    # Diferença Donkelar vs CAMS em 2023
+    Diferenca_2023 = Donkelar_2023 - CAMS_2023
+  )
+
+# Join com a geometria
+mapa_final <- mapa_mun_ba %>% 
+  left_join(dados_mapa, by = "cd_mun")
+
+# Determina as escalas máximas para os mapas
+max_pm25_anual <- max(c(mapa_final$Donkelar_2022, mapa_final$Donkelar_2023, mapa_final$CAMS_2022, mapa_final$CAMS_2023), na.rm = TRUE)
+max_abs_diff <- max(abs(c(mapa_final$Donkelar_Dif_Anual, mapa_final$CAMS_Dif_Anual, mapa_final$Diferenca_2022, mapa_final$Diferenca_2023)), na.rm = TRUE)
+
+# Datasets separados para Boxplots
+dados_donkelar <- dados_mun_mes_agregados %>% filter(Fonte == "Donkelar")
+dados_cams <- dados_mun_mes_agregados %>% filter(Fonte == "CAMS")
+saveRDS(dados_don_cams_mes, "dados_pm25_bahia.rds")
+
+```
+
+*Visão Geral da Poluição do Ar (PM2.5) na Bahia*
+
+
+A Bahia, com sua vasta extensão territorial e diversidade ambiental, enfrenta desafios na qualidade do ar, especialmente relacionados a eventos sazonais como as queimadas. Esta análise comparativa entre as fontes de dados Donkelar e CAMS (2022-2023) visa fornecer uma base robusta para a tomada de decisão ambiental no estado.
+
+
+***Lema da Bahia: "Virtus Sola Nobilitat" (Só a virtude enobrece).***
+
+
+*1. Resumo Estatístico Comparativo*
+
+  A análise descritiva é crucial para entender as diferenças inerentes às metodologias de coleta de dados. A fonte Donkelar tende a registrar picos de poluição mais elevados e maior variabilidade (Desvio Padrão) quando comparada à CAMS, que apresenta uma média e distribuição mais estável.
+ 
+ 
+```{r summary_table_1, fig.cap="Tabela 1: Resumo Estatístico da Média Mensal de PM2.5 (μg/m³) por Fonte e Ano (Bahia, 2022-2023)"}
+# CÁLCULO: Filtra Donkelar e agrupa apenas por ano.
+resumo_donkelar <- dados_donkelar %>%
+  group_by(Ano = ano) %>% 
+  summarise(
+    N_Obs_Mensais = n(),
+    Média = round(mean(media_pm25, na.rm = TRUE), 2),
+    Mediana = round(median(media_pm25, na.rm = TRUE), 2),
+    `Desvio Padrão (SD)` = round(sd(media_pm25, na.rm = TRUE), 2),
+    Mínimo = round(min(media_pm25, na.rm = TRUE), 2),
+    Máximo = round(max(media_pm25, na.rm = TRUE), 2),
+    .groups = 'drop'
+  )
+
+# EXIBIÇÃO
+resumo_donkelar %>%
+  knitr::kable("html", caption = "Tabela 1.1: Resumo Estatístico (Donkelar)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F) %>%
+  row_spec(0, background = "#004B8D", color = "white")
+```
+
+```{r summary_table_2, fig.cap="Tabela 1: Resumo Estatístico da Média Mensal de PM2.5 (μg/m³) por Fonte e Ano (Bahia, 2022-2023)"}  
+# CÁLCULO: Filtra CAMS e agrupa apenas por ano.
+resumo_cams <- dados_cams %>%
+  group_by(Ano = ano) %>% 
+  summarise(
+    N_Obs_Mensais = n(),
+    Média = round(mean(media_pm25, na.rm = TRUE), 2),
+    Mediana = round(median(media_pm25, na.rm = TRUE), 2),
+    `Desvio Padrão (SD)` = round(sd(media_pm25, na.rm = TRUE), 2),
+    Mínimo = round(min(media_pm25, na.rm = TRUE), 2),
+    Máximo = round(max(media_pm25, na.rm = TRUE), 2),
+    .groups = 'drop'
+  )
+
+# EXIBIÇÃO
+resumo_cams %>%
+  knitr::kable("html", caption = "Tabela 1.2: Resumo Estatístico (CAMS)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F) %>%
+  row_spec(0, background = "#E6B32D", color = "black")
+
+```
+
+
+
+*2. Análise Temporal e Sazonal por Fonte*
+
+
+**2.1. Variação Sazonal (Fonte Donkelar)**
+
+ O boxplot para ***Donkelar*** mostra uma variação sazonal extremamente marcada. Os picos de poluição nos meses de inverno/seca (Julho a Outubro) são muito evidentes, com valores máximos anuais significativamente mais altos em comparação com o CAMS.
+ 
+
+```{r setup_e_boxplot1}  
+# Boxplot da Donkelar: Separa os anos lado a lado.
+plot_boxplot_don <- ggplot(dados_donkelar, aes(x = mes_nome, y = media_pm25, fill = factor(ano))) +
+  geom_boxplot(alpha = 0.8, outlier.shape = NA, position = position_dodge(preserve = "single")) +
+  labs(
+    title = "Variação Sazonal de PM2.5 (Fonte Donkelar)",
+    x = "Mês",
+    y = expression("Média Mensal de PM2.5 (μg/m"^3*")"),
+    fill = "Ano"
+  ) +
+  scale_fill_manual(values = c("2022" = "#004B8D", "2023" = "#E6B32D")) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", color = "#004B8D"),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Separação por ano para atender o pedido de 2 boxplots para a fonte (faceta)
+boxplot_don_2022 <- dados_donkelar %>% filter(ano == 2022) %>%
+  ggplot(aes(x = mes_nome, y = media_pm25)) +
+  geom_boxplot(fill = "#004B8D", alpha = 0.8, outlier.shape = NA) +
+  labs(title = "Donkelar - 2022", x = "Mês", y = expression("PM2.5 (μg/m"^3*")")) +
+  theme_minimal(base_size = 14) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+boxplot_don_2023 <- dados_donkelar %>% filter(ano == 2023) %>%
+  ggplot(aes(x = mes_nome, y = media_pm25)) +
+  geom_boxplot(fill = "#E6B32D", alpha = 0.8, outlier.shape = NA) +
+  labs(title = "Donkelar - 2023", x = "Mês", y = "") +
+  theme_minimal(base_size = 14) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggarrange(boxplot_don_2022, boxplot_don_2023, ncol = 2, nrow = 1)
+```
+
+**2.2. Variação Sazonal (Fonte CAMS)**
+
+O boxplot para ***CAMS*** também mostra a sazonalidade, mas com uma distribuição de valores mais estreita. Os valores médios e máximos nos meses de pico são mais controlados em comparação com Donkelar, o que é típico de dados de satélite que suavizam picos extremos e localizados.
+
+```{r setup_e_boxplot2}
+# --- BOXPLOT CAMS: COMPARAÇÃO 2022 E 2023 SEPARADA POR PAINEL ---
+
+plot_boxplot_cams_separado <- dados_don_cams_mes %>%
+  # 1. Filtra apenas para a Fonte CAMS
+  filter(Fonte == "CAMS") %>% 
+  
+  ggplot(aes(x = factor(mes), y = media_pm25)) + # Remove fill = factor(ano)
+  
+  # Usamos facet_wrap para separar os anos em painéis
+  facet_wrap(~ ano, ncol = 1) + # ncol=1 coloca 2022 em cima e 2023 embaixo
+  
+  geom_boxplot() + # Agora não precisa de position_dodge
+  
+  # Linha de referência da OMS (5 μg/m³)
+  geom_hline(yintercept = 5, linetype = "dashed", color = "red", linewidth = 0.7) +
+  
+  # Ajuste de Zoom (para clareza)
+  coord_cartesian(ylim = c(0, 30)) + 
+  
+  labs(
+    title = "Distribuição Mensal de PM2.5 na Bahia por Ano (Fonte CAMS)",
+    subtitle = "Linha pontilhada vermelha = Limite Anual da OMS (5 μg/m³)",
+    x = "Mês",
+    y = expression(PM[2.5]~(mu*g/m^3))
+  ) +
+  theme_minimal() +
+  theme(
+    # Garante que os rótulos do eixo X (meses) não se misturem
+    axis.text.x = element_text(size = 9),
+    plot.title = element_text(size = 14) 
+  )
+
+print(plot_boxplot_cams_separado)
+```
+
+
+
+*3. Análise Geográfica por Fonte e Divergência*
+
+
+**3.1. Média Anual de PM2.5 por Fonte (2022 e 2023)**
+
+
+ Os mapas espaciais detalham as distribuições de poluição. Tanto Donkelar quanto CAMS localizam as áreas de maior poluição (em cores mais escuras) na região Oeste e Sudoeste da Bahia. No entanto, o padrão de manchas de Donkelar (Figuras A e C) tende a ser mais pontual e intenso do que o de CAMS (Figuras B e D).
+
+
+
+```{r setup_e_graf1}   
+# Função auxiliar para gerar os mapas
+plot_pm25_map <- function(data, fill_var, title, limit, color_scale) {
+  ggplot(data %>% filter(!is.na(.data[[fill_var]]))) +
+    geom_sf(aes(fill = .data[[fill_var]]), color = NA) +
+    scale_fill_viridis_c(option = color_scale, name = expression("PM2.5"), na.value = "lightgray", limits = c(0, limit)) +
+    labs(title = title) + 
+    theme_minimal() + 
+    theme(legend.position = "right", plot.title = element_text(face = "bold", size = 8))
+}
+
+plot_don_2022 <- plot_pm25_map(mapa_final, "Donkelar_2022", "A) Média Anual PM2.5 (2022) - Donkelar", max_pm25_anual, "magma")
+plot_cams_2022 <- plot_pm25_map(mapa_final, "CAMS_2022", "B) Média Anual PM2.5 (2022) - CAMS", max_pm25_anual, "magma")
+plot_don_2023 <- plot_pm25_map(mapa_final, "Donkelar_2023", "C) Média Anual PM2.5 (2023) - Donkelar", max_pm25_anual, "magma")
+plot_cams_2023 <- plot_pm25_map(mapa_final, "CAMS_2023", "D) Média Anual PM2.5 (2023) - CAMS", max_pm25_anual, "magma")
+
+ggarrange(plot_don_2022, plot_cams_2022, plot_don_2023, plot_cams_2023, ncol = 2, nrow = 2)
+```
+
+
+**4. Mapas de Diferenças Anuais (Diferença: Ano 2023 - Ano 2022)**
+
+
+Estes mapas mostram a variação da $\text{PM}_{2.5}$ de 2022 para 2023, separadamente para Donkelar e CAMS. Valores em vermelho indicam aumento da poluição; em azul indicam redução.
+
+
+
+```{r setup_e_graf2}   
+# Função auxiliar para gerar os mapas de diferença
+plot_diff_map <- function(data, fill_var, title, limit) {
+  ggplot(data %>% filter(!is.na(.data[[fill_var]]))) +
+    geom_sf(aes(fill = .data[[fill_var]]), color = NA) +
+    scale_fill_gradient2(
+      low = "#004B8D", high = "red", mid = "white", 
+      midpoint = 0, limit = c(-limit, limit),
+      name = expression("Dif. (μg/m"^3*")"), na.value = "lightgray"
+    ) +
+    labs(title = title) + 
+    theme_minimal() +
+    theme(legend.position = "right", plot.title = element_text(face = "bold", size = 8))
+}
+
+plot_diff_don <- plot_diff_map(mapa_final, "Donkelar_Dif_Anual", "A) Diferença Anual (2023 - 2022) - Donkelar", max_abs_diff)
+plot_diff_cams <- plot_diff_map(mapa_final, "CAMS_Dif_Anual", "B) Diferença Anual (2023 - 2022) - CAMS", max_abs_diff)
+
+ggarrange(plot_diff_don, plot_diff_cams, ncol = 2, nrow = 1)
+```
+
+
+*5. Mapas de Diferença Entre Fontes (Donkelar - CAMS)*
+
+Estes mapas são cruciais para a análise de calibração, pois mostram a divergência entre Donkelar (dados mais precisos/caros) e CAMS (dados de satélite/baratos) para cada ano. Valores em vermelho indicam onde Donkelar é mais alto que CAMS.
+
+```{r setup_e_graf3} 
+plot_diff_2022 <- plot_diff_map(mapa_final, "Diferenca_2022", "A) Divergência 2022 (Donkelar - CAMS)", max_abs_diff)
+plot_diff_2023 <- plot_diff_map(mapa_final, "Diferenca_2023", "B) Divergência 2023 (Donkelar - CAMS)", max_abs_diff)
+
+ggarrange(plot_diff_2022, plot_diff_2023, ncol = 2, nrow = 1)
+```
+
+*6. Conclusão Sobre as analises*
+
+O estudo confirma que, embora ambas as fontes concordem com o padrão sazonal da poluição, o Donkelar se apresenta como a fonte mais rigorosa para o cálculo de exposição na Bahia, por fornecer estimativas de concentração consistentemente mais altas e uma variabilidade mais ampla, que é essencial para identificar eventos críticos. A persistência de concentrações acima dos limites da OMS em ambas as fontes ressalta a urgência de políticas ambientais focadas na redução de emissões, especialmente durante os meses de seca (Julho-Setembro).
